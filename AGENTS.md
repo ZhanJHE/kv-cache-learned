@@ -8,7 +8,7 @@
 
 本项目是**面向大模型推理的 KV Cache 学习型替换策略**研究仓库，目标是通过轻量预测器估计缓存块未来重用概率，在显存受限场景下优于传统 LRU 策略。
 
-**当前状态**：本项目目前为**实验规划阶段**，尚未包含实际可运行的源代码。所有设计细节、模块划分和代码蓝图均记录在 `exp_plan.md` 中。
+**当前状态**：代码已实现（阶段 1→3 完整源码 + 阶段 4 预留），可直接上传至 AutoDL 等 Linux CUDA 环境运行。原始蓝图仍保留在 `exp_plan.md` 中供对照。
 
 - **目标平台**：AutoDL（Linux, CUDA, PyTorch 预装环境）
 - **推理框架**：vLLM ≥ 0.5.0
@@ -20,94 +20,77 @@
 
 ## 仓库结构
 
-当前仓库仅包含以下文件，**不存在 `pyproject.toml`、`requirements.txt`、`setup.py` 等常规构建配置文件**：
-
 ```
 kv-cache-learned/
-├── AGENTS.md          # 本文件
-├── README.md          # 项目简介（中文）
-├── exp_plan.md        # 完整实验规划文档（含代码蓝图、执行步骤、风险应对）
-└── LICENSE            # GPL v3
+├── AGENTS.md                # 本文件
+├── README.md                # 项目简介（中文）
+├── exp_plan.md              # 完整实验规划文档（~35 KB，含原始蓝图）
+├── DEPLOYMENT.md            # AutoDL 云端部署与环境配置指南
+├── LICENSE                  # GPL v3
+├── autodl_cloud/
+│   └── requirements.txt     # Python 依赖清单
+├── data/
+│   ├── traces/              # KV Cache 访问 Trace（JSONL，运行后生成）
+│   └── features/            # 预测器训练数据（预留）
+├── vllm_patch/
+│   ├── __init__.py
+│   ├── trace_logger.py      # 无侵入式 Hook vLLM BlockManager
+│   └── api_server_wrapper.py # 带 Hook 启动 vLLM API Server（子进程包装器）
+├── predictor/
+│   ├── __init__.py
+│   ├── model.py             # ReusePredictor（2 层 MLP）
+│   ├── dataset.py           # KVCacheDataset（8 维特征构造）
+│   └── train.py             # 训练脚本（含早停）
+├── simulator/
+│   ├── __init__.py
+│   ├── policies.py          # LRU / FIFO / Learned / Belady
+│   ├── simulator.py         # BlockManagerSimulator
+│   └── evaluate.py          # 命中率对比与绘图
+├── real_system/
+│   ├── __init__.py
+│   └── learned_evictor.py   # vLLM 自定义 Evictor 插件（Tier 2 / 可选）
+├── scripts/
+│   ├── setup_env.sh         # 环境初始化脚本
+│   ├── collect_trace.py     # Trace 收集入口（阶段 1）
+│   └── run_all.sh           # 一键执行 1→2→3
+└── results/
+    ├── figures/             # 实验图表产出
+    └── logs/                # 实验日志
 ```
 
-### 关键文件说明
-
-- **`exp_plan.md`**（~35 KB）：唯一的核心文档。内含四阶段实验的完整设计：
-  1. **Trace 收集**：通过 Hook vLLM `BlockManager` 记录 `allocate`/`access`/`evict`/`free` 事件；
-  2. **预测器训练**：基于 Trace 构建 8 维特征，训练轻量 2 层 MLP（`ReusePredictor`）做二分类（未来是否被重用）；
-  3. **Trace-driven 模拟器**：实现 LRU、FIFO、Learned、Belady 四种驱逐策略，对比命中率；
-  4. **真实系统集成**：将 Learned Evictor 手动集成到 vLLM 源码（Tier 2 / 可选加分项）。
-
-  文档中还包含预设目录结构、环境安装命令、`scripts/run_all.sh` 一键脚本、实验检查清单与风险应对表。
-
-- **`README.md`**：一句话概括项目目标与技术路线。
-
-- **`LICENSE`**：GPL v3 全文。
+> **注意**：`data/traces/` 与 `results/` 下的具体文件需在 AutoDL 环境运行后生成。
 
 ---
 
-## 技术栈与运行时架构（规划）
-
-根据 `exp_plan.md`，项目计划采用如下技术栈：
+## 技术栈与运行时架构
 
 | 层级 | 技术/工具 | 说明 |
 |------|-----------|------|
 | 语言 | Python 3.10 | 全部脚本与模型代码 |
 | 深度学习 | PyTorch 2.1.2 | 预测器训练与推理 |
-| 推理框架 | vLLM 0.5.0 | 提供 LLM  serving 与 BlockManager Hook 点 |
+| 推理框架 | vLLM 0.5.0 | 提供 LLM serving 与 BlockManager Hook 点 |
 | 模型生态 | transformers, datasets, accelerate | 模型下载与数据加载 |
 | 数据科学 | numpy, pandas, scikit-learn | 特征工程与指标计算 |
 | 可视化 | matplotlib, seaborn | 实验图表产出 |
 | 其他 | tqdm, requests | 进度条与 HTTP 请求 |
 
-### 计划中的模块划分
-
-```
-/root/autodl-tmp/kv_cache_project/        # 文档中假设的部署根目录
-├── data/
-│   ├── sharegpt.json                     # 原始数据集
-│   ├── traces/                           # KV Cache 访问 Trace（JSONL）
-│   └── features/                         # 预测器训练数据
-├── vllm_patch/
-│   ├── trace_logger.py                   # 无侵入式 Hook vLLM BlockManager
-│   └── block_manager_v2.py               # 扩展 BlockManager（预留）
-├── predictor/
-│   ├── model.py                          # ReusePredictor（2 层 MLP）
-│   ├── dataset.py                        # KVCacheDataset（8 维特征构造）
-│   └── train.py                          # 训练脚本（含早停）
-├── simulator/
-│   ├── policies.py                       # LRU / FIFO / Learned / Belady
-│   ├── simulator.py                      # BlockManagerSimulator
-│   └── evaluate.py                       # 命中率对比与绘图
-├── real_system/
-│   └── learned_evictor.py              # vLLM 自定义 Evictor 插件
-├── scripts/
-│   ├── setup_env.sh
-│   ├── collect_trace.sh
-│   ├── run_simulation.sh
-│   ├── run_benchmark.sh
-│   └── run_all.sh                        # 一键执行三阶段实验
-└── results/
-    ├── figures/                          # 命中率对比图、ROC 曲线等
-    └── logs/                             # 实验日志
-```
-
-> **注意**：以上目录和文件目前**均不存在于本仓库**中，仅在 `exp_plan.md` 中以代码块形式提供蓝图。若后续实际创建，应同步更新本文件。
-
 ---
 
-## 构建与运行命令（规划）
+## 构建与运行命令
 
-由于目前无实际源码，以下命令来自 `exp_plan.md` 的设计，供未来实施参考：
-
-### 环境准备
+### 环境准备（AutoDL）
 
 ```bash
 conda create -n kv_cache python=3.10 -y
 conda activate kv_cache
-pip install vllm==0.5.0 torch==2.1.2 transformers datasets accelerate \
-            numpy pandas matplotlib seaborn scikit-learn tqdm
+pip install -r autodl_cloud/requirements.txt
 ```
+
+### 路径说明
+
+各脚本已改用相对路径或 `pathlib` 自动推导项目根目录，不再强制依赖 `/root/autodl-tmp/`：
+- `PROJECT_ROOT = Path(__file__).resolve().parent.parent`
+- 模型路径可通过环境变量 `KV_CACHE_MODEL` 覆盖。
 
 ### 各阶段执行
 
@@ -121,7 +104,7 @@ cd predictor && python train.py && cd ..
 # 阶段 3：模拟器评估
 cd simulator && python evaluate.py && cd ..
 
-# 一键执行（规划中）
+# 一键执行
 bash scripts/run_all.sh
 ```
 
@@ -129,19 +112,17 @@ bash scripts/run_all.sh
 
 ## 代码风格与开发约定
 
-根据 `exp_plan.md` 中的代码蓝图，项目遵循以下风格：
-
 - **语言**：所有注释、文档字符串、变量命名均采用**中文语境**（如 `event_type="allocate"`，类名 `KVTraceLogger`，注释使用中文）。
 - **类型注解**：广泛使用 Python `typing`（`Dict`, `List`, `Optional` 等）。
-- **配置硬编码**：脚本顶部使用全大写常量（`TRACE_PATH`, `MODEL_SAVE`, `BATCH_SIZE` 等），路径默认指向 `/root/autodl-tmp/kv_cache_project/`。
-- ** Hook 风格**：通过动态替换类方法（Monkey Patch）实现无侵入式 Trace 收集，避免直接修改 vLLM 源码（Tier 1）。Tier 2 才需要手动修改 vLLM 源码。
+- **配置**：脚本顶部使用全大写常量（`TRACE_PATH`, `MODEL_SAVE`, `BATCH_SIZE` 等），但优先通过 `pathlib` 推导或环境变量覆盖。
+- **Hook 风格**：通过动态替换类方法（Monkey Patch）实现无侵入式 Trace 收集，避免直接修改 vLLM 源码（Tier 1）。Tier 2 才需要手动修改 vLLM 源码。
 - **模型保存**：使用 `torch.save(model.state_dict(), ...)` 只存权重，不存完整模型。
 
 ---
 
 ## 测试策略
 
-当前仓库**无测试代码**。`exp_plan.md` 中提供了实验检查清单（Checklist）作为人工验证标准：
+当前仓库**无自动化单元测试**。`exp_plan.md` 中提供了实验检查清单（Checklist）作为人工验证标准：
 
 | 检查项 | 通过标准 |
 |--------|---------|
@@ -159,14 +140,13 @@ bash scripts/run_all.sh
 ## 安全与合规注意事项
 
 1. **GPL v3 许可证**：本项目采用 GPL v3。若后续集成到 vLLM 源码或分发二进制，需遵守相应源码开放与许可证传递义务。
-2. **路径硬编码风险**：`exp_plan.md` 中的大量脚本使用绝对路径 `/root/autodl-tmp/...`，在 AutoDL 之外的环境运行时需要批量替换。
-3. **vLLM 版本锁定**：明确锁定 `vllm==0.5.0`，因为 Hook 逻辑依赖特定版本的内部 API（`BlockManager`, `PhysicalTokenBlock`）。升级 vLLM 可能导致 Hook 失效。
-4. **无秘密管理**：当前设计中未涉及 API Key、数据库密码等敏感信息；若未来扩展需注意避免将 HuggingFace Token 等硬编码入仓库。
+2. **vLLM 版本锁定**：明确锁定 `vllm==0.5.0`，因为 Hook 逻辑依赖特定版本的内部 API（`BlockManager`, `PhysicalTokenBlock`）。升级 vLLM 可能导致 Hook 失效。
+3. **无秘密管理**：当前设计中未涉及 API Key、数据库密码等敏感信息；若未来扩展需注意避免将 HuggingFace Token 等硬编码入仓库。
 
 ---
 
 ## 给 AI 助手的操作建议
 
-- **若用户要求实现代码**：请优先阅读 `exp_plan.md`，其中每个模块都有可直接转写的 Python 代码块。按阶段 1→2→3→4 顺序实施最符合原设计意图。
-- **若用户要求运行实验**：当前仓库无实际代码，需先根据 `exp_plan.md` 生成源码和目录结构，并确保运行在具备 CUDA + vLLM 的 Linux 环境（如 AutoDL）。
+- **若用户要求实现代码**：核心源码已全部生成，请按 `exp_plan.md` 检查是否遗漏；如需修改特征维度或模型结构，请同步更新 `predictor/` 与 `simulator/` 中的对应实现，并保持 `exp_plan.md` 一致。
+- **若用户要求运行实验**：当前环境为 Windows，vLLM 相关代码（Trace 收集、真实系统集成）需在 Linux+CUDA 环境（如 AutoDL）运行。模拟器与预测器训练脚本理论上可在 CPU 环境测试，但建议上传至目标环境后统一执行 `bash scripts/run_all.sh`。
 - **若用户要求修改设计**：任何对模块划分、特征维度、模型结构的改动都应同步更新 `exp_plan.md`，以保持文档与实现一致。
