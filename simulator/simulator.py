@@ -22,10 +22,12 @@ class BlockManagerSimulator:
         self.stats["total_access"] += 1
 
         if block_id in self.cache:
-            # Hit
+            # Hit：用最新特征更新 metadata（历史信息已变化）
             self.stats["hits"] += 1
-            self.cache[block_id].last_access = timestamp
-            self.cache[block_id].access_count += 1
+            meta = self.cache[block_id]
+            meta.features = features
+            meta.last_access = timestamp
+            meta.access_count += 1
             self.policy.on_access(block_id, timestamp)
             return True
         else:

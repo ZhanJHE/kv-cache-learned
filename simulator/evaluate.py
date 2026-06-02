@@ -17,26 +17,50 @@ PREDICTOR_PATH = PROJECT_ROOT / "predictor" / "reuse_predictor.pt"
 RESULT_DIR = PROJECT_ROOT / "results"
 
 
-def build_feature(event, num_layers=32):
-    """从单个 trace 事件构建特征（与 dataset 一致）"""
-    return np.array([
-        event["layer_id"] / num_layers,
-        event["num_tokens"] / 16.0,
-        1.0 if event.get("is_prefix", False) else 0.0,
-        0.0,  # 历史访问次数（简化：单事件无法获得历史）
-        0.0,
-        0.0,
-        0.0,
-        event["timestamp"] / 10000.0,
-    ], dtype=np.float32)
+def build_feature(event, history, num_layers=32, history_window=50):
+    """
+    从 trace 事件和 block 历史访问记录构建完整 8 维特征（与 dataset.py 一致）
+
+    参数：
+        event:    当前 trace 事件（dict）
+        history:  该 block 的历史访问事件列表（不含本次），按时间排序
+    """
+    hist = history[-history_window:]   # 最近 history_window 次历史访问
+
+    # 历史访问时间戳列表
+    hist_timestamps = [h["timestamp"] for h in hist]
+
+    features = [
+        event["layer_id"] / num_layers,                            # 层深度（归一化）
+        event["num_tokens"] / 16.0,                                # block 占用率
+        1.0 if event.get("is_prefix", False) else 0.0,             # 是否前缀
+        len(hist),                                                 # 历史访问次数
+        np.mean(hist_timestamps) if hist_timestamps else 0,        # 平均访问时间
+        (event["timestamp"] - hist[-1]["timestamp"]) if hist else 1000,  # 距上次访问
+        len([h for h in hist if h.get("is_prefix", False)]) / max(len(hist), 1),  # 历史前缀比例
+        event["timestamp"] / 10000.0,                              # 全局时间（归一化）
+    ]
+    return np.array(features, dtype=np.float32)
 
 
 def run_simulation(policy_name, policy, total_blocks, trace_events):
     sim = BlockManagerSimulator(total_blocks, policy)
+    block_histories = {}  # block_id → 历史事件列表（按时间升序）
 
     for e in trace_events:
-        feat = build_feature(e)
-        sim.access(e["block_id"], feat, e["timestamp"])
+        bid = e["block_id"]
+
+        # allocate 事件表示新的 block 生命周期，重置历史
+        if e["event_type"] == "allocate":
+            block_histories[bid] = []
+
+        # 获取历史并构建特征
+        history = block_histories.get(bid, [])
+        feat = build_feature(e, history)
+        sim.access(bid, feat, e["timestamp"])
+
+        # 将当前事件加入该 block 的历史记录
+        block_histories[bid].append(e)
 
     return sim.get_hit_rate(), sim.get_stats()
 
