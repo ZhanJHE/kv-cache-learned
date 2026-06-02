@@ -1,0 +1,103 @@
+# AutoDL 云端部署指南
+
+本目录包含 KV Cache Learned 项目在 **AutoDL** 平台运行所需的全部配置和脚本。
+
+---
+
+## 快速开始（推荐）
+
+### 1. 上传代码到 AutoDL
+
+在 AutoDL 实例的 JupyterLab / SSH 终端中：
+
+```bash
+cd /root/autodl-tmp
+git clone <你的仓库地址> kv-cache-learned
+cd kv-cache-learned
+```
+
+或者通过 AutoDL 控制台上传打包好的代码压缩包并解压。
+
+### 2. 一键部署并运行
+
+```bash
+cd /root/autodl-tmp/kv-cache-learned
+bash autodl_cloud/deploy.sh
+```
+
+此脚本会自动完成：
+- 创建并激活 `kv_cache` conda 环境（Python 3.10）
+- 安装所有 Python 依赖
+- 验证 vLLM 和 PyTorch CUDA 可用性
+- 下载 ShareGPT 数据集
+- 执行阶段 1→3 全链路实验（Trace 收集 → 预测器训练 → 模拟器评估）
+
+> **预计耗时**：首次运行约 30~60 分钟（含模型下载），后续约 10~20 分钟。
+
+---
+
+## 分步执行（如需调试或跳过某些步骤）
+
+```bash
+# 1. 环境准备
+bash scripts/setup_env.sh
+conda activate kv_cache
+
+# 2. 数据集（如已下载可跳过）
+wget -O data/sharegpt.json \
+  https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+
+# 3. 阶段1：收集 Trace
+python scripts/collect_trace.py
+
+# 4. 阶段2：训练预测器
+cd predictor && python train.py && cd ..
+
+# 5. 阶段3：模拟器评估
+cd simulator && python evaluate.py && cd ..
+```
+
+---
+
+## 目录说明
+
+| 文件 | 说明 |
+|------|------|
+| `requirements.txt` | Python 依赖清单 |
+| `deploy.sh` | **一键部署脚本**（入口） |
+| `README.md` | 本文件 |
+
+---
+
+## 常见问题
+
+### Q1: 模型下载慢或失败？
+- 使用 AutoDL 内置模型库（如有）
+- 或通过 ModelScope 镜像下载后创建软链接：
+  ```bash
+  ln -s /root/autodl-tmp/models/<你的模型> /root/autodl-tmp/models/llama-2-7b-chat
+  ```
+
+### Q2: 如何只跑阶段 2/3（跳过 Trace 收集）？
+- 将已有的 `sharegpt_trace.jsonl` 放到 `data/traces/`，然后直接运行 `bash scripts/run_all.sh`。
+
+### Q3: 实验结果在哪里？
+```
+results/
+├── figures/hit_rate_comparison.png   # 命中率对比图
+└── logs/simulation_results.json      # 原始数据
+predictor/reuse_predictor.pt          # 训练好的预测器权重
+data/traces/sharegpt_trace.jsonl      # 收集的 Trace
+```
+
+### Q4: vLLM 版本兼容性？
+本项目锁定 `vllm==0.5.0`，Hook 逻辑依赖该版本的内部 API。请勿擅自升级 vLLM。
+
+---
+
+## 环境要求
+
+- **GPU**: NVIDIA GPU（推荐 RTX 3090 / 4090 / A10 / A100，显存 ≥ 24GB）
+- **CUDA**: ≥ 11.8
+- **Python**: 3.10
+- **OS**: Linux（AutoDL 默认 Ubuntu）
