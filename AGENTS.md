@@ -67,7 +67,7 @@ kv-cache-learned/
 | 层级 | 技术/工具 | 说明 |
 |------|-----------|------|
 | 语言 | Python 3.10 | 全部脚本与模型代码 |
-| 深度学习 | PyTorch 2.1.2 | 预测器训练与推理 |
+| 深度学习 | PyTorch 2.3.0 | 预测器训练与推理 |
 | 推理框架 | vLLM 0.5.0 | 提供 LLM serving 与 BlockManager Hook 点 |
 | 模型生态 | transformers, datasets, accelerate | 模型下载与数据加载 |
 | 数据科学 | numpy, pandas, scikit-learn | 特征工程与指标计算 |

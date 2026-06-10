@@ -1,0 +1,33 @@
+# Large data files
+data/sharegpt.json
+data/*.json
+
+# Model weights (downloaded separately)
+models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Distribution / packaging
+*.zip
+*.gz
+*.tar
+!data/traces/*.jsonl.gz
+
+# Results logs (keep figures and summary JSONs)
+results/logs/vllm_server.log*
+results/logs/requirements_frozen.txt
+results/logs/gpu_info.txt
+results/logs/system_info.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

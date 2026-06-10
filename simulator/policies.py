@@ -1,5 +1,5 @@
 import numpy as np
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from typing import Dict, List, Optional
 import torch
 
@@ -37,7 +37,6 @@ class LRUPolicy(EvictionPolicy):
         self.access_order[block_id] = metadata
 
     def select_victim(self, candidates):
-        # 返回最久未访问的
         for bid in self.access_order:
             if bid in candidates:
                 return bid
@@ -45,63 +44,77 @@ class LRUPolicy(EvictionPolicy):
 
 
 class FIFOPolicy(EvictionPolicy):
-    """FIFO 基线"""
+    """FIFO 基线（使用 deque，O(1) 出队）"""
     def __init__(self):
-        self.insert_order = []
+        self.insert_order = deque()
 
     def on_insert(self, block_id, metadata):
         self.insert_order.append(block_id)
 
     def select_victim(self, candidates):
         while self.insert_order:
-            bid = self.insert_order.pop(0)
+            bid = self.insert_order.popleft()
             if bid in candidates:
                 return bid
-        return list(candidates.keys())[0]
+        return next(iter(candidates))
 
 
 class LearnedPolicy(EvictionPolicy):
-    """学习型策略：驱逐预测重用概率最低的块"""
+    """
+    学习型策略：预测 block 剩余访问次数，驱逐剩余最少的。
+
+    批量推理（高效）：每次驱逐时对所有候选 block 一次性推理，
+    选择模型预测分数最低的驱逐。
+    """
     def __init__(self, model_path, device='cpu'):
         from predictor.model import ReusePredictor
-        self.model = ReusePredictor().to(device)
+        self.model = ReusePredictor(input_dim=10).to(device)
         self.model.load_state_dict(torch.load(model_path, map_location=device))
         self.model.eval()
         self.device = device
 
     def on_access(self, block_id, timestamp):
-        pass  # 不依赖访问历史
+        pass
 
     def on_insert(self, block_id, metadata):
         pass
 
     def select_victim(self, candidates: Dict[int, BlockMetadata]):
-        # 对所有候选块打分，选概率最低的驱逐
-        scores = {}
-        with torch.no_grad():
-            for bid, meta in candidates.items():
-                feat = torch.FloatTensor(meta.features).unsqueeze(0).to(self.device)
-                score = self.model(feat).item()  # 重用概率
-                scores[bid] = score
+        if not candidates:
+            return None
 
-        return min(scores, key=scores.get)
+        bids = list(candidates.keys())
+        feats = torch.from_numpy(
+            np.array([candidates[bid].features for bid in bids], dtype=np.float32)
+        ).to(self.device)
+
+        with torch.no_grad():
+            scores = self.model(feats).squeeze(-1).cpu().numpy()
+
+        # 回归：分数越低 = 剩余访问越少 = 优先驱逐
+        return bids[int(scores.argmin())]
 
 
 class BeladyPolicy(EvictionPolicy):
-    """Belady 最优策略（需要未来信息，仅作上界参考）"""
+    """
+    Belady 最优策略（需要未来信息，仅作上界参考）
+
+    驱逐"下一次访问最远"的 block（包括永不再访问的）。
+    """
     def __init__(self, future_trace):
         """
-        future_trace: list of (timestamp, block_id) 未来访问序列
+        future_trace: list of (timestamp, block_id) 按时间排序的未来访问序列
         """
         self.future_access = defaultdict(list)
         for ts, bid in future_trace:
             self.future_access[bid].append(ts)
-        # 转为迭代器
-        self.future_iters = {bid: iter(ts_list) for bid, ts_list in self.future_access.items()}
+        # 转为迭代器，每次 on_access 时推进
+        self.future_iters = {
+            bid: iter(ts_list) for bid, ts_list in self.future_access.items()
+        }
         self.next_access = {}
 
     def on_access(self, block_id, timestamp):
-        # 更新该 block 的下一次访问时间
         it = self.future_iters.get(block_id)
         if it:
             try:
@@ -115,7 +128,6 @@ class BeladyPolicy(EvictionPolicy):
         self.on_access(block_id, metadata.first_access)
 
     def select_victim(self, candidates):
-        # 驱逐下一次访问最远的（或不再访问的）
         farthest = -1
         victim = None
         for bid in candidates:

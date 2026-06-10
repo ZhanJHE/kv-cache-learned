@@ -55,7 +55,7 @@ class KVTraceLogger:
             original_append_slots = BlockManager.append_slots
 
             # 获取层数（从模型配置推断，这里简化处理）
-            num_layers = 32  # Llama-2-7B 默认 32 层，实际应从模型获取
+            num_layers = 28  # 默认层数（Qwen2.5-7B=28, Llama-2-7B=32），实际应从模型配置获取
 
             # 在闭包中捕获 logger 实例，避免依赖全局变量
             logger = self

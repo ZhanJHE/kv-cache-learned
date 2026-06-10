@@ -15,7 +15,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # 配置
-MODEL_PATH = os.environ.get("KV_CACHE_MODEL", "/root/autodl-tmp/models/llama-2-7b-chat")
+MODEL_PATH = os.environ.get("KV_CACHE_MODEL", "/root/autodl-tmp/models/qwen2.5-7b-instruct")
 TRACE_OUTPUT = PROJECT_ROOT / "data" / "traces" / "sharegpt_trace.jsonl"
 GPU_UTIL = 0.6
 MAX_SEQ_LEN = 4096
@@ -27,7 +27,7 @@ def prepare_model():
     if not os.path.exists(MODEL_PATH):
         print("Model not found locally. Downloading from HuggingFace...")
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        model_name = "meta-llama/Llama-2-7b-chat-hf"
+        model_name = "Qwen/Qwen2.5-7B-Instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
         os.makedirs(MODEL_PATH, exist_ok=True)

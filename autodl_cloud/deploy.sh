@@ -63,7 +63,7 @@ else
 fi
 
 # ---------- 6. 模型路径提示 ----------
-MODEL_PATH="/root/autodl-tmp/models/llama-2-7b-chat"
+MODEL_PATH="/root/autodl-tmp/models/qwen2.5-7b-instruct"
 if [ ! -d "$MODEL_PATH" ]; then
     echo "[Info] 模型未找到: $MODEL_PATH"
     echo "       实验脚本将尝试从 HuggingFace 自动下载（需网络通畅）"
