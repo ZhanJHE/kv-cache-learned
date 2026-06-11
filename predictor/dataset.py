@@ -8,28 +8,25 @@ from pathlib import Path
 
 class KVCacheDataset(Dataset):
     """
-    从 Trace 构建预测器训练数据（回归）
+    从 Trace 构建预测器训练数据（回归，无未来泄露）
 
     目标：给定一个 block 在某次 access 时的状态，
     预测该 block 还会被访问多少次（剩余访问次数）。
 
-    驱逐决策：保留剩余访问次数多的 block，驱逐剩余访问次数少的。
+    所有特征仅依赖当前及过去的信息，不依赖 last_ts / total_blocks 等未来信息。
 
-    特征（10 维）：
+    特征（8 维）：
         0. ref_count_norm:      当前 ref_count（归一化 cap=20）
-        1. access_count:        该 block 历史 access 次数（归一化 cap=200）
+        1. access_count_norm:   该 block 历史 access 次数（归一化 cap=200）
         2. time_since_last:     距离该 block 上一次 access 的时间（归一化 /100）
         3. interval_cv:         access 间隔的变异系数（std/mean）
-        4. global_progress:     全局时间进度
-        5. seq_lifetime_ratio:  所属序列已存活时间比例
-        6. seq_remaining_ratio: 所属序列剩余时间比例
-        7. block_pos_in_seq:    block 在所属序列中的相对位置（0=最晚, 1=最早）
-        8. cross_seq_count:     该 block 被多少不同序列使用过（归一化 cap=10）
-        9. active_seqs:         当前活跃序列数（归一化 cap=50）
+        4. log_access_count:    log2(cnt+1)/log2(201)，对数尺度下的访问量
+        5. interval_trend:      最近3次间隔均值 / 全部间隔均值（<0.5加速, >0.5减速）
+        6. tail_density:        最近 10 次访问的时间跨度 / 总跨度（尾部集中度）
+        7. free_events_seen:    生命周期内该 block 被 free 的次数（归一化 cap=5）
     """
     def __init__(self, trace_path, history_window=200):
         self.history_window = history_window
-
         self.traces = self._load_traces(trace_path)
         self.samples, self.sample_block_ids = self._build_samples()
 
@@ -45,43 +42,16 @@ class KVCacheDataset(Dataset):
         return traces
 
     def _build_samples(self):
-        # ========== 1. 预计算每个序列的活跃区间 ==========
-        seq_info = {}
-        for t in self.traces:
-            sid = t["seq_id"]
-            ts = t["timestamp"]
-            if sid not in seq_info:
-                seq_info[sid] = {
-                    "first_ts": ts,
-                    "last_ts": ts,
-                    "blocks": set(),
-                }
-            info = seq_info[sid]
-            info["first_ts"] = min(info["first_ts"], ts)
-            info["last_ts"] = max(info["last_ts"], ts)
-            info["blocks"].add(t["block_id"])
-
-        for sid in seq_info:
-            seq_info[sid]["total_blocks"] = max(len(seq_info[sid]["blocks"]), 1)
-
-        # ========== 2. 按 block_id 分组 ==========
+        # ========== 1. 按 block_id 分组 ==========
         block_events = defaultdict(list)
         for t in self.traces:
             block_events[t["block_id"]].append(t)
 
-        # ========== 3. 统计每个 block 被多少不同序列使用 ==========
-        block_seq_users = defaultdict(set)
-        for t in self.traces:
-            block_seq_users[t["block_id"]].add(t["seq_id"])
-
-        # ========== 4. 构建训练样本 ==========
-        # 每个 block 可能有多个生命周期（被 free 后又 allocate）
-        # 每个生命周期独立构建样本，与 evaluate.py 的 precompute 行为一致
+        # ========== 2. 构建训练样本 ==========
         samples = []
         sample_block_ids = []
         for block_id, events in block_events.items():
             events.sort(key=lambda x: x["timestamp"])
-            cross_seq_count = len(block_seq_users[block_id])
 
             # 按 allocate 事件切分生命周期
             lifetimes = []
@@ -96,21 +66,15 @@ class KVCacheDataset(Dataset):
                 lifetimes.append(current_life)
 
             for life_events in lifetimes:
-                # 在这个生命周期内构建样本
                 for i, evt in enumerate(life_events):
                     if evt["event_type"] != "access":
                         continue
 
-                    # 注入跨序列信息
-                    evt = dict(evt)
-                    evt["cross_seq_count"] = cross_seq_count
-
-                    # 特征：使用当前生命周期内的历史
-                    feat = self._extract_features(evt, life_events, i, seq_info)
+                    feat = self._extract_features(evt, life_events, i)
 
                     # 标签：当前生命周期内的剩余访问次数
                     remaining = sum(
-                        1 for e in life_events[i + 1 :] if e["event_type"] == "access"
+                        1 for e in life_events[i + 1:] if e["event_type"] == "access"
                     )
                     label = min(remaining, 200) / 200.0
 
@@ -119,74 +83,63 @@ class KVCacheDataset(Dataset):
 
         return samples, sample_block_ids
 
-    def _extract_features(self, evt, all_events, idx, seq_info):
-        """提取 10 维特征（与 evaluate.py 的 build_feature 必须一致！）"""
-        hist = all_events[max(0, idx - self.history_window) : idx]
+    def _extract_features(self, evt, all_events, idx):
+        """提取 8 维特征（与 evaluate.py 的 build_feature 必须一致！）"""
+        hist = all_events[max(0, idx - self.history_window):idx]
         hist_access = [e for e in hist if e["event_type"] == "access"]
 
-        sid = evt["seq_id"]
-        seq = seq_info.get(
-            sid,
-            {"first_ts": evt["timestamp"], "last_ts": evt["timestamp"], "total_blocks": 1},
-        )
-        seq_lifetime = max(seq["last_ts"] - seq["first_ts"], 1)
-        seq_elapsed = evt["timestamp"] - seq["first_ts"]
+        # --- F0: ref_count ---
+        f0 = min(evt.get("ref_count", 1), 20) / 20.0
 
-        # block 在该序列中的相对位置
-        block_pos_in_seq = len(hist_access) / max(seq["total_blocks"], 1)
+        # --- F1: access count ---
+        f1 = min(len(hist_access), 200) / 200.0
 
-        # access 间隔的变异系数
+        # --- F2: time since last access ---
+        if hist_access:
+            f2 = (evt["timestamp"] - hist_access[-1]["timestamp"]) / 100.0
+        else:
+            f2 = 1.0
+
+        # --- F3: interval cv ---
         if len(hist_access) >= 2:
             intervals = [
                 hist_access[j + 1]["timestamp"] - hist_access[j]["timestamp"]
                 for j in range(len(hist_access) - 1)
             ]
-            interval_cv = np.std(intervals) / (np.mean(intervals) + 1e-6)
+            f3 = min(np.std(intervals) / (np.mean(intervals) + 1e-6), 2.0)
         else:
-            interval_cv = 0.0
+            f3 = 0.0
 
-        # 当前活跃序列数
-        active_seqs = sum(
-            1
-            for sid2, si in seq_info.items()
-            if si["first_ts"] <= evt["timestamp"] <= si["last_ts"]
-        )
+        # --- F4: log access count ---
+        f4 = np.log2(len(hist_access) + 1) / np.log2(201)
 
-        features = [
-            # 0. ref_count
-            min(evt.get("ref_count", 1), 20) / 20.0,
+        # --- F5: interval trend (recent vs historical) ---
+        if len(hist_access) >= 4:
+            intervals = [
+                hist_access[j + 1]["timestamp"] - hist_access[j]["timestamp"]
+                for j in range(len(hist_access) - 1)
+            ]
+            recent_mean = np.mean(intervals[-3:])
+            all_mean = np.mean(intervals)
+            f5 = min(recent_mean / max(all_mean, 1e-6), 2.0) / 2.0
+        else:
+            f5 = 0.5
 
-            # 1. 历史 access 次数
-            min(len(hist_access), 200) / 200.0,
+        # --- F6: tail density ---
+        if len(hist_access) >= 10:
+            tail_span = hist_access[-1]["timestamp"] - hist_access[-10]["timestamp"]
+            all_span = hist_access[-1]["timestamp"] - hist_access[0]["timestamp"]
+            f6 = min(tail_span / max(all_span, 1), 1.0)
+        elif len(hist_access) >= 2:
+            all_span = hist_access[-1]["timestamp"] - hist_access[0]["timestamp"]
+            f6 = min(1.0, all_span / max(all_span, 1))
+        else:
+            f6 = 0.5
 
-            # 2. 距离上次 access
-            (
-                (evt["timestamp"] - hist_access[-1]["timestamp"]) / 100.0
-                if hist_access
-                else 1.0
-            ),
+        # --- F7: free events seen in this lifecycle ---
+        f7 = min(sum(1 for e in hist if e["event_type"] == "free"), 5) / 5.0
 
-            # 3. access 间隔变异系数
-            min(interval_cv, 2.0),
-
-            # 4. 全局时间进度
-            evt["timestamp"] / max(seq["last_ts"], 1),
-
-            # 5. 序列已存活比例
-            seq_elapsed / seq_lifetime,
-
-            # 6. 序列剩余比例
-            1.0 - seq_elapsed / seq_lifetime,
-
-            # 7. block 在序列中的相对位置
-            block_pos_in_seq,
-
-            # 8. 跨序列使用数
-            min(evt.get("cross_seq_count", 1), 10) / 10.0,
-
-            # 9. 活跃序列数
-            min(active_seqs, 50) / 50.0,
-        ]
+        features = [f0, f1, f2, f3, f4, f5, f6, f7]
         return np.array(features, dtype=np.float32)
 
     def __len__(self):

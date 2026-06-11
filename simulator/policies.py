@@ -68,7 +68,7 @@ class LearnedPolicy(EvictionPolicy):
     """
     def __init__(self, model_path, device='cpu'):
         from predictor.model import ReusePredictor
-        self.model = ReusePredictor(input_dim=10).to(device)
+        self.model = ReusePredictor(input_dim=8).to(device)
         self.model.load_state_dict(torch.load(model_path, map_location=device))
         self.model.eval()
         self.device = device

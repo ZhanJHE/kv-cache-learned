@@ -58,7 +58,7 @@ def train():
 
     # ========== 2. 模型 ==========
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ReusePredictor(input_dim=10).to(device)
+    model = ReusePredictor(input_dim=8).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 class ReusePredictor(nn.Module):
     """3 层 MLP + LayerNorm + Residual，预测 block 剩余访问次数（回归）"""
-    def __init__(self, input_dim=10, hidden_dim=128, dropout=0.2):
+    def __init__(self, input_dim=8, hidden_dim=128, dropout=0.2):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
