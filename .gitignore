@@ -1,6 +1,7 @@
 # Large data files
 data/sharegpt.json
 data/*.json
+data/.cache/
 
 # Model weights (downloaded separately)
 models/
