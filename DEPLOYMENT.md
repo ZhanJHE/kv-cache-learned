@@ -15,7 +15,7 @@
 | 硬盘空间 | 50 GB | 100 GB（含模型与数据集） |
 | 网络 | 可访问 HuggingFace / ModelScope | 可访问 HuggingFace |
 
-> **注意**：本项目当前阶段主要在 **AutoDL** 平台验证，若在其他环境运行，请将脚本中的绝对路径 `/root/autodl-tmp/kv_cache_project/` 替换为实际路径。
+> **注意**：本项目当前阶段主要在 **AutoDL** 平台验证，若在其他环境运行，请将脚本中的绝对路径 `/root/autodl-tmp/` 替换为实际路径。
 
 ---
 
@@ -24,10 +24,8 @@
 在终端执行以下命令：
 
 ```bash
-# 1. 克隆仓库（若在 AutoDL 已挂载数据盘，建议放到 /root/autodl-tmp/）
-cd /root/autodl-tmp/
-git clone <your-repo-url> kv_cache_project
-cd kv_cache_project
+# 1. 进入项目目录（若在 AutoDL 已挂载数据盘，建议放到 /root/autodl-tmp/）
+cd /root/autodl-tmp/kv-cache-learned
 
 # 2. 创建 Conda 环境
 conda create -n kv_cache python=3.10 -y
@@ -59,7 +57,7 @@ conda activate kv_cache
 
 ```text
 vllm==0.5.0
-torch==2.1.2
+torch==2.3.0
 transformers
 datasets
 accelerate
@@ -77,7 +75,7 @@ tqdm
 pip install -r autodl_cloud/requirements.txt
 ```
 
-> **版本锁定说明**：`vllm==0.5.0` 与 `torch==2.1.2` 为硬编码版本。Trace Hook 逻辑依赖 vLLM 特定版本的内部 API（`BlockManager`、`PhysicalTokenBlock`），升级可能导致 Trace 收集失效。
+> **版本锁定说明**：`vllm==0.5.0` 与 `torch==2.3.0` 为硬编码版本。Trace Hook 逻辑依赖 vLLM 特定版本的内部 API（`BlockManager`、`PhysicalTokenBlock`），升级可能导致 Trace 收集失效。
 
 ### 3.3 初始化目录结构
 
@@ -170,26 +168,25 @@ nvidia-smi
 | 3. 模拟器评估 | `cd simulator && python evaluate.py && cd ..` | 对比 LRU / FIFO / Learned / Belady 命中率 |
 | 一键执行 | `bash scripts/run_all.sh` | 顺序执行 1→2→3（脚本需提前创建） |
 
-> **提示**：当前仓库处于实验规划阶段，上述脚本需根据 `exp_plan.md` 中的代码蓝图实际编写后才能运行。
+> **提示**：实验已全部完成并得到验证结果。v5 最终版在 Cache=100 时 Learned 命中率 19.73% vs LRU 14.76%（+4.97pp）。
 
 ---
 
 ## 六、配置文件与路径说明
 
-本项目在脚本顶部使用**全大写常量**管理路径，默认指向 `/root/autodl-tmp/kv_cache_project/`。若需迁移到其他机器，请全局替换以下前缀：
+本项目在脚本顶部使用**全大写常量**管理路径，默认基于 `pathlib` 自动推导项目根目录。以下为典型路径示例：
 
 ```python
-# 示例（各脚本中常见）
-PROJECT_ROOT = "/root/autodl-tmp/kv_cache_project"
-TRACE_PATH = f"{PROJECT_ROOT}/data/traces/sharegpt_trace.jsonl"
-MODEL_SAVE = f"{PROJECT_ROOT}/results/models/reuse_predictor.pt"
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TRACE_PATH = PROJECT_ROOT / "data" / "traces" / "sharegpt_trace.jsonl"
+MODEL_SAVE = PROJECT_ROOT / "results" / "models" / "reuse_predictor.pt"
 ```
 
-建议替换为相对路径或环境变量形式：
+也可通过环境变量覆盖模型路径：
 
-```python
-import os
-PROJECT_ROOT = os.environ.get("KV_CACHE_PROJECT", "/root/autodl-tmp/kv_cache_project")
+```bash
+export KV_CACHE_MODEL=/path/to/your/model
 ```
 
 ---

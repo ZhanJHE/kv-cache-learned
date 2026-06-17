@@ -27,6 +27,16 @@ results/logs/system_info.txt
 .DS_Store
 Thumbs.db
 
+# Personal & privacy
+垃圾/
+实验改动和日志.log
+实验报告.docx
+环境配置指南.md
+
+# Generated appendix (not part of source)
+附录temp.docx
+课程论文_詹家赫_2023103587.pdf
+
 # IDE
 .idea/
 .vscode/

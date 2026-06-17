@@ -1,0 +1,102 @@
+digraph architecture {
+    rankdir=TB;
+    splines=polyline;
+    bgcolor="white";
+    fontname="SimHei";
+    label="图1  系统整体架构：三阶段流水线";
+    labeljust=l;
+    fontsize=14;
+    labelloc=t;
+    compound=true;
+    dpi=150;
+    pad=0.3;
+    nodesep=0.2;
+    ranksep=0.3;
+
+    /* ---- Default styles ---- */
+    node [fontname="SimHei", fontsize=9];
+    edge [fontname="SimHei", fontsize=7, arrowsize=0.5];
+
+    /* ============================================= */
+    /* Stage 1: Trace Collection                     */
+    /* ============================================= */
+    subgraph cluster_stage1 {
+        label="阶段1：Trace 收集";
+        fontsize=11;
+        fontcolor="#1a365d";
+        style="rounded,dashed";
+        color="#3182ce";
+        bgcolor="#ebf8ff";
+        penwidth=1.5;
+        margin=10;
+
+        vllm [label="vLLM推理引擎\n(Qwen2.5-7B)", shape=box3d, style="filled", fillcolor="#bee3f8", color="#3182ce", fontcolor="#1a365d", width=1.2, height=0.6, fontsize=8];
+        mhook [label="Monkey-Patch Hook\nBlockSpaceManagerV1", shape=box, style="filled,rounded", fillcolor="#90cdf4", color="#2b6cb0", fontcolor="#1a365d", width=1.2, height=0.6, fontsize=8];
+        trace_json [label="sharegpt_trace.jsonl\n317K events·718 Blocks", shape=folder, style="filled", fillcolor="#63b3ed", color="#2c5282", fontcolor="white", width=1.2, height=0.6, fontsize=8];
+
+        { rank=same; vllm; mhook; trace_json }
+        vllm -> mhook [label="动态替换", color="#2b6cb0"];
+        mhook -> trace_json [label="持久化", color="#2b6cb0"];
+    }
+
+    /* Arrow: Stage1 -> Stage2 */
+    trace_json -> fe [label="", color="#2b6cb0", penwidth=1.5];
+
+    /* ============================================= */
+    /* Stage 2: Predictor Training                   */
+    /* ============================================= */
+    subgraph cluster_stage2 {
+        label="阶段2：预测器训练";
+        fontsize=11;
+        fontcolor="#1a365d";
+        style="rounded,dashed";
+        color="#805ad5";
+        bgcolor="#faf5ff";
+        penwidth=1.5;
+        margin=10;
+
+        fe [label="特征工程\n8维在线特征", shape=box, style="filled,rounded", fillcolor="#e9d8fd", color="#805ad5", fontcolor="#44337a", width=1.2, height=0.6, fontsize=8];
+        label_eng [label="回归标签\n剩余访问次数", shape=note, style="filled", fillcolor="#d6bcfa", color="#6b46c1", fontcolor="#44337a", width=1.2, height=0.6, fontsize=8];
+        model [label="3层MLP\n+LayerNorm+Residual", shape=box3d, style="filled", fillcolor="#b794f4", color="#553c9a", fontcolor="white", width=1.2, height=0.6, fontsize=8];
+        pt [label="reuse_predictor.pt\n预测器权重", shape=folder, style="filled", fillcolor="#9f7aea", color="#44337a", fontcolor="white", width=1.2, height=0.6, fontsize=8];
+
+        { rank=same; fe; label_eng; model; pt }
+        fe -> label_eng [label="对齐", color="#6b46c1"];
+        {fe label_eng} -> model [label="训练", color="#6b46c1"];
+        model -> pt [label="保存", color="#6b46c1"];
+    }
+
+    /* Arrow: Stage2 -> Stage3 */
+    pt -> sim [label="加载模型", color="#6b46c1", penwidth=1.5];
+
+    /* ============================================= */
+    /* Stage 3: Simulation Evaluation                */
+    /* ============================================= */
+    subgraph cluster_stage3 {
+        label="阶段3：仿真评估";
+        fontsize=11;
+        fontcolor="#1a365d";
+        style="rounded,dashed";
+        color="#38a169";
+        bgcolor="#f0fff4";
+        penwidth=1.5;
+        margin=10;
+
+        trace_again [label="Trace事件流\n(access/alloc/free)", shape=box, style="filled,rounded", fillcolor="#c6f6d5", color="#38a169", fontcolor="#22543d", width=1.2, height=0.6, fontsize=8];
+        sim [label="BlockManager\nSimulator", shape=box3d, style="filled", fillcolor="#9ae6b4", color="#2f855a", fontcolor="#22543d", width=1.2, height=0.6, fontsize=8];
+        strategies [label="对比策略\nLRU·FIFO·Learned·Belady", shape=box, style="filled,rounded", fillcolor="#68d391", color="#276749", fontcolor="#22543d", width=1.2, height=0.6, fontsize=8];
+        metric [label="评估指标\nHit Rate", shape=note, style="filled", fillcolor="#48bb78", color="#22543d", fontcolor="white", width=1.2, height=0.6, fontsize=8];
+        out1 [label="hit_rate_comparison.png\n命中率对比图", shape=folder, style="filled", fillcolor="#38a169", color="#1d5a31", fontcolor="white", width=1.2, height=0.6, fontsize=8];
+        out2 [label="simulation_results.json\n原始数据", shape=folder, style="filled", fillcolor="#38a169", color="#1d5a31", fontcolor="white", width=1.2, height=0.6, fontsize=8];
+
+        /* Two rows within Stage 3 for compactness */
+        /* Row 1: trace -> sim */
+        trace_again -> sim;
+
+        /* Row 2: strategies, metric, outputs (below sim) */
+        sim -> metric [label="评估", color="#276749"];
+        strategies -> sim [label="策略选择", dir=both, color="#276749"];
+        metric -> out1 [label="图表", color="#1d5a31"];
+        metric -> out2 [label="数据", color="#1d5a31"];
+    }
+}
