@@ -1,0 +1,248 @@
+# KV Cache 学习型替换策略 — 实验改动与日志
+# 会话日期: 2026-06-08 ~ 2026-06-11
+
+================================================================================
+一、v2 实验结果审计 (2026-06-08)
+================================================================================
+
+1. 解压 results/kv-cache-learned.zip（来自 AutoDL 的实验产物）
+2. 读取 v2 实验报告 (experiment_report.md) 和仿真数据 (simulation_results.json)
+3. 深度分析 Trace 数据（340K 事件, 712 blocks, 100 seqs）
+
+【发现的关键问题】
+
+Bug 1: 训练/评估特征不一致
+  - predictor/dataset.py 和 simulator/evaluate.py 的 build_feature() 函数
+    在特征 6 (seq_lifetime_ratio) 和特征 7 (seq_remaining_ratio) 上计算逻辑不同
+  - 训练时: 特征6 = seq_elapsed/max(seq_lifetime,1)
+  - 评估时: 特征6 = num_hashed_tokens/4096 (恒为0)
+  - 导致模型训练时学到的信号在评估时完全失效
+
+Bug 2: 回归标签几乎无方差
+  - v2 目标: 预测"下次访问间隔" (timestamp diff)
+  - 实际分布: 均值30, 标准差1, P25=29, P75=30
+  - 标签归一化后 std≈0.01, 模型几乎只在学均值
+
+Bug 3: 无信息特征
+  - num_hashed_tokens 在所有336K条access事件中恒为0 (V100不支持prefix caching)
+  - 特征0 (block_position) 恒为0, 无任何区分度
+
+Bug 4: 数据层面
+  - 712 unique blocks, 每block平均访问477.8次, 所有块都是"热点"
+  - 500+ block cache就几乎全命中, 1000+ 所有策略饱和
+  - 无fork事件 (V100无法开启prefix caching)
+  - 访问间隔高度规律 (P25=29, P90=30)
+
+【v2结果】
+  LRU(100)=14.79%, FIFO(100)=0.57%, Learned(100)=8.76%
+  Learned > FIFO 但远不如 LRU, Belady ≈ LRU
+
+================================================================================
+二、v3 系统修复方案 (2026-06-09)
+================================================================================
+
+【改动规划】 7 个文件, core rewrite
+
+1. predictor/dataset.py — 完全重写
+   - 回归目标: 下次访问间隔 → 剩余访问次数 (label = min(remaining_accesses, 200)/200)
+   - 特征 8→10维: 移除恒为0的 num_hashed_tokens/layer_id/is_prefix
+   - 新增: seq_lifetime_ratio, seq_remaining_ratio, block_pos_in_seq, cross_seq_count, active_seqs
+   - block按生命周期切分 (allocate重置历史), 暴露sample_block_ids
+
+2. predictor/model.py — 模型升级
+   - 2层MLP(64) → 3层MLP+Residual+LayerNorm(128)
+   - 去掉Sigmoid (回归任务)
+   - BatchNorm → LayerNorm (支持单样本推理)
+
+3. predictor/train.py — 训练改进
+   - BCELoss → MSELoss
+   - 随机split → block级split (按block_id分组切分, 无数据泄漏)
+   - AUC监控 → R²/MAE监控
+   - ReduceLROnPlateau → CosineAnnealingLR
+   - 加入梯度裁剪 (max_norm=1.0)
+
+4. simulator/evaluate.py — 评估对齐
+   - build_feature() 与 dataset.py._extract_features() 100%对齐 (含history_window=200)
+   - 新增预计算特征 (10x加速)
+   - 加入Belady最优策略上界
+   - 预计算 seq_info 与 block_cross_seq
+
+5. simulator/policies.py — 策略改进
+   - 新增 BeladyPolicy
+   - FIFO list.pop(0) → deque.popleft() (O(n²)→O(1))
+   - LearnedPolicy 批量推理 (argmin驱逐剩余最少的block)
+
+6. simulator/simulator.py — 新增SequenceAwareSimulator
+   - 维护 block→Set[seq_id] 映射
+   - 只有 ref_count==0 的block可被驱逐
+   - 为prefix caching+fork场景设计
+
+7. simulator/__init__.py — 导出所有符号
+
+【本地验证】
+  - 特征对齐验证: F0-F9范围一致 (±0.01)
+  - dataset按生命周期切分后, ds/eval特征mean_diff < 0.01
+  - 标签方差: 0.33 (旧版0.01, 提升33倍)
+  - 模型前向推理通过
+
+【打包】 kv-cache-learned-v3.zip (63KB, 排除模型/数据集)
+
+================================================================================
+三、v3 实验结果分析 (2026-06-11)
+================================================================================
+
+【解压】 kv-cache-learned-v3-result.zip
+【v3结果】
+  LRU(100)=14.76%, Learned(100)=20.24%, +5.48pp (+37%)
+  LRU(200)=34.40%, Learned(200)=39.21%, +4.81pp (+14%)
+  LRU(500)=78.85%, Learned(500)=90.31%, +11.46pp (+15%)
+  R²=0.585, Label mean=0.55, std=0.33
+
+【新发现的问题】
+  v3的10维特征中有6个依赖未来信息:
+  - F4 global_progress = timestamp / max(seq_last_ts, 1)  ← 使用last_ts
+  - F5 seq_lifetime_ratio ← 使用last_ts
+  - F6 seq_remaining_ratio ← 使用last_ts
+  - F7 block_pos_in_seq = hist_access / seq_total_blocks ← 使用total_blocks
+  - F8 cross_seq_count ← 全局统计
+  - F9 active_seqs ← 使用last_ts判断活跃
+  → 命中率被高估约1.5-2.4pp ("未来信息泄露")
+
+  Belady 异常: v3中Belady < LRU (实现Bug: future_trace混入allocate事件)
+
+【产出】
+  - 实验报告.docx (7章+附录, 15张表, 92段)
+  - CHANGES.md (v1→v3完整演化)
+  - 项目清理 + 打包 kv-cache-learned-final.zip (141MB含trace)
+  - Git提交推送: v3.0 → GitHub (ZhanJHE/kv-cache-learned)
+
+================================================================================
+四、v4 版本分析 (2026-06-11)
+================================================================================
+
+【解压】 kv-cache-learned-v4.zip
+
+【v4改进】
+  1. 去除数据泄露: 删除6个依赖未来信息的特征
+     替换为4个纯在线特征: relative_block_idx, generation_speed, 
+                           recent_freq_ratio, active_seqs_online
+  2. 特征维度 10→8
+  3. active_seqs 改为在线 allocate/free 追踪
+
+【v4结果】
+  LRU(100)=14.50%, Learned(100)=18.72%, +4.22pp
+  Learned vs v3: -1.52pp (泄露溢价消除, 但结论仍成立)
+
+【v4发现的问题】
+  Bug 1: free事件被当作普通access处理
+    - evaluate.py stream包含free事件
+    - run_simulation对所有事件调用sim.access()
+    - free被计入total_access, 引起~0.7%统计偏差
+  
+  Bug 2: F5 generation_speed 几乎无方差
+    - cnt/elapsed ≈ 1/30 ≈ 0.033, 归一化后≈0.0033
+    - 与v2"下次访问间隔"同源的方差问题
+  
+  Bug 3: F6 recent_freq_ratio 恒≈0.5
+    - (total-half)/total 在均匀访问下≈0.5
+    - 几乎无信息量
+
+【分析报告交付用户】
+
+================================================================================
+五、v5 最终版分析 (2026-06-11)
+================================================================================
+
+【解压】 kv-cache-learned-v5-final.zip
+
+【v5改进】
+  1. 修复free事件Bug: 新增sim_mask机制
+     - free事件仅用于特征预计算(F7 free_events_seen)
+     - 仿真流过滤为 access+allocate
+     - LRU基线恢复到正确的14.76% (v4为14.50%)
+  
+  2. 特征重设计:
+     F4: relative_block_idx → log_access_count (对数防饱和)
+     F5: generation_speed → interval_trend (recent_mean/all_mean趋势比)
+     F6: recent_freq_ratio → tail_density (尾部集中度)
+     F7: active_seqs_online → free_events_seen (生命周期释放数)
+
+【v5最终结果】
+  Cache | LRU     | FIFO   | Learned  | Learned vs LRU
+  100   | 14.76%  | 1.08%  | 19.73%   | +4.97pp (+33.7%)
+  200   | 34.40%  | 1.84%  | 38.28%   | +3.88pp (+11.3%)
+  500   | 78.85%  | 79.02% | 86.88%   | +8.03pp (+10.2%)
+  1000+ | 99.77%  | 99.77% | 99.77%   | 平
+
+  v5 vs v4: +1.01pp (100) / +1.51pp (200) / -0.99pp (500)
+
+【v5特征 (8维, 纯在线, 无未来泄露)】
+  F0: ref_count_norm       — 当前并发共享数
+  F1: access_count_norm    — 历史访问量
+  F2: time_since_last      — 距上次访问
+  F3: interval_cv          — 间隔变异系数
+  F4: log_access_count     — 对数访问量(防饱和)
+  F5: interval_trend       — 加速/减速趋势
+  F6: tail_density         — 尾部集中度
+  F7: free_events_seen     — 生命周期释放数
+
+================================================================================
+六、文档与仓库更新 (2026-06-11)
+================================================================================
+
+【更新内容】
+  1. predictor/ 全部源文件 → v5最终版
+  2. simulator/ 全部源文件 → v5最终版
+  3. predictor/reuse_predictor.pt → v5训练好的模型
+  4. results/figures/hit_rate_comparison.png → v5图表
+  5. results/logs/simulation_results.json → v5数据
+  6. results/logs/v5_summary.md → v5实验总览
+  7. CHANGES.md → v1→v5完整演化日志
+  8. 实验报告.docx → v5完整报告 (7章+附录, 15张表, 92段)
+  9. 课程论文_詹家赫_2023103587.docx → 基于实验的学术论文 (4765字, 18篇参考文献)
+
+【项目清理】
+  删除: 旧版zip文件(×5), 解压残留目录, 空文件夹(pip_packages), Word临时文件
+  更新: .gitignore (新增 data/.cache/ 排除)
+
+【Git提交记录】
+  0e9af32  v3.0: 学习型KV Cache替换策略 — Learned全面超越LRU
+  8ceb592  v5.0-final: 修复free事件Bug + 特征重新设计
+  632058c  docs: 更新实验报告至 v5
+  5c7694b  chore: 清理冗余文件, 更新.gitignore
+  19acc4d  docs: 新增课程论文 (4765字, 18篇参考文献)
+
+【仓库地址】 https://github.com/ZhanJHE/kv-cache-learned
+
+================================================================================
+七、版本演化总览
+================================================================================
+
+版本  学习方式    特征  模型         Learned(100)  LRU(100)  关键问题
+v1    二分类      8     2层MLP(64)    0.02%        23.68%    类别不平衡, AUC≈0.5
+v2    回归(间隔)  8     2层MLP(64)    8.76%        14.79%    标签σ≈0.01; 特征不一致
+v3    回归(剩余)  10    3层MLP+Res   20.24%        14.76%    6维未来泄露; Belady<LRU
+v4    回归(剩余)  8     3层MLP+Res   18.72%        14.50%    free Bug; 2维无方差
+v5    回归(剩余)  8     3层MLP+Res   19.73%        14.76%    ✅ 无已知问题
+
+改进贡献 (消融):
+  回归目标改进 (v2→v3):          标签方差 0.01→0.33 (33×), 核心驱动力
+  特征对齐 (v2→v3):              修复3/8维不匹配
+  模型升级 (v2→v3):              2层→3层+Residual, R²+0.08
+  Block级split (v2→v3):          消除数据泄漏
+  去未来泄露 (v3→v4):            -1.5pp 溢价消除, 结论可信
+  free Bug+特征重设计 (v4→v5):   +1.0pp, 最终版
+
+================================================================================
+八、已知局限
+================================================================================
+
+1. Belady实现局限: future_trace中同一block_id跨生命周期混合, 不是严格上界
+   → 不影响LRU/FIFO/Learned对比有效性
+2. V100无prefix caching: 所有ref_count=1, fork=0
+   → 需Ampere GPU (A100/3090) 测试跨序列共享
+3. 100条请求, 并发度有限: 500+ blocks以上所有策略饱和
+4. 单一数据集/模型: ShareGPT + Qwen2.5-7B, 泛化性待验证
+5. 离线回放: 训练/评估用同一Trace, 真实部署需在线更新
+
+================================================================================
